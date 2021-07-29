@@ -2,6 +2,7 @@
 
 pragma solidity 0.6.12;
 
+import "@openzeppelin/contracts/math/SafeMath.sol";
 import "./owner/Operator.sol";
 import "./interfaces/ITaxable.sol";
 import "./interfaces/IUniswapV2Router.sol";
@@ -17,11 +18,12 @@ import "./interfaces/IERC20.sol";
     http://tomb.finance
 */
 contract TaxOfficeV2 is Operator {
+    using SafeMath for uint256;
+
     address public tomb = address(0x6c021Ae822BEa943b2E66552bDe1D2696a53fbB7);
     address public wftm = address(0x21be370D5312f44cB42ce377BC9b8a0cEF1A4C83);
     address public uniRouter = address(0xF491e7B69E4244ad4002BC14e878a34207E38c29);
 
-    bool TAXFREE_LP_ENABLED = true;
     mapping(address => bool) public taxExclusionEnabled;
 
     function setTaxTiersTwap(uint8 _index, uint256 _value) public onlyOperator returns (bool) {
@@ -57,7 +59,9 @@ contract TaxOfficeV2 is Operator {
     }
 
     function _excludeAddressFromTax(address _address) private returns (bool) {
-        return ITaxable(tomb).excludeAddress(_address);
+        if (!ITaxable(tomb).isAddressExcluded(_address)) {
+            return ITaxable(tomb).excludeAddress(_address);
+        }
     }
 
     function includeAddressInTax(address _address) external onlyOperator returns (bool) {
@@ -65,53 +69,99 @@ contract TaxOfficeV2 is Operator {
     }
 
     function _includeAddressInTax(address _address) private returns (bool) {
-        return ITaxable(tomb).includeAddress(_address);
-    }
-
-    function createLPTaxFree(uint256 amtTomb, uint256 amtWFTM) external returns (bool) {
-        require(amtTomb != 0 && amtWFTM != 0, "amounts can't be 0");
-        if (TAXFREE_LP_ENABLED && taxExclusionEnabled[msg.sender]) {
-            _excludeAddressFromTax(msg.sender);
-            _excludeAddressFromTax(uniRouter);
-            IERC20(tomb).transferFrom(msg.sender, address(this), amtTomb);
-            IERC20(wftm).transferFrom(msg.sender, address(this), amtWFTM);
-            // mint LP
-            uint256 liquidity;
-            ( , , liquidity) = IUniswapV2Router(uniRouter).addLiquidity(tomb, wftm, amtTomb, amtWFTM, 0, 0, msg.sender, block.timestamp);
-            _includeAddressInTax(msg.sender);
-            _includeAddressInTax(uniRouter);
-        } else {
-            _excludeAddressFromTax(msg.sender);
-            IERC20(tomb).transferFrom(msg.sender, address(this), amtTomb);
-            IERC20(wftm).transferFrom(msg.sender, address(this), amtWFTM);
-            // mint LP
-            uint256 liquidity;
-            ( , , liquidity) = IUniswapV2Router(uniRouter).addLiquidity(tomb, wftm, amtTomb, amtWFTM, 0, 0, msg.sender, block.timestamp);
-            _includeAddressInTax(msg.sender);
+        if (ITaxable(tomb).isAddressExcluded(_address)) {
+            return ITaxable(tomb).includeAddress(_address);
         }
     }
 
-    function createLPTaxFreeNative(uint256 amtTomb) external payable returns (bool) {
+    function taxRate() external view returns (uint256) {
+        return ITaxable(tomb).taxRate();
+    }
+
+    function addLiquidityTaxFree(
+        address token,
+        uint256 amtTomb,
+        uint256 amtToken,
+        uint256 amtTombMin,
+        uint256 amtTokenMin
+    )
+        external
+        returns (
+            uint256,
+            uint256,
+            uint256
+        )
+    {
+        require(amtTomb != 0 && amtToken != 0, "amounts can't be 0");
+        _excludeAddressFromTax(msg.sender);
+
+        IERC20(tomb).transferFrom(msg.sender, address(this), amtTomb);
+        IERC20(token).transferFrom(msg.sender, address(this), amtToken);
+        _approveTokenIfNeeded(tomb, uniRouter);
+        _approveTokenIfNeeded(token, uniRouter);
+
+        _includeAddressInTax(msg.sender);
+
+        uint256 resultAmtTomb;
+        uint256 resultAmtToken;
+        uint256 liquidity;
+        (resultAmtTomb, resultAmtToken, liquidity) = IUniswapV2Router(uniRouter).addLiquidity(
+            tomb,
+            token,
+            amtTomb,
+            amtToken,
+            amtTombMin,
+            amtTokenMin,
+            msg.sender,
+            block.timestamp
+        );
+
+        if(amtTomb.sub(resultAmtTomb) > 0) {
+            IERC20(tomb).transfer(msg.sender, amtTomb.sub(resultAmtTomb));
+        }
+        if(amtToken.sub(resultAmtToken) > 0) {
+            IERC20(token).transfer(msg.sender, amtToken.sub(resultAmtToken));
+        }
+        return (resultAmtTomb, resultAmtToken, liquidity);
+    }
+
+    function addLiquidityETHTaxFree(
+        uint256 amtTomb,
+        uint256 amtTombMin,
+        uint256 amtFtmMin
+    )
+        external
+        payable
+        returns (
+            uint256,
+            uint256,
+            uint256
+        )
+    {
         require(amtTomb != 0 && msg.value != 0, "amounts can't be 0");
-        if (TAXFREE_LP_ENABLED && taxExclusionEnabled[msg.sender]) {
-            _excludeAddressFromTax(msg.sender);
-            _excludeAddressFromTax(uniRouter);
-            IERC20(tomb).transferFrom(msg.sender, address(this), amtTomb);
-            // mint LP
-            _approveTokenIfNeeded(tomb, uniRouter);
-            uint256 liquidity;
-            ( , , liquidity) = IUniswapV2Router(uniRouter).addLiquidityETH{ value : msg.value }(tomb, amtTomb, 0, 0, msg.sender, block.timestamp);
-            _includeAddressInTax(msg.sender);
-            _includeAddressInTax(uniRouter);
-        } else {
-            _excludeAddressFromTax(msg.sender);
-            IERC20(tomb).transferFrom(msg.sender, address(this), amtTomb);
-            // mint LP
-            _approveTokenIfNeeded(tomb, uniRouter);
-            uint256 liquidity;
-            ( , , liquidity) = IUniswapV2Router(uniRouter).addLiquidityETH{ value : msg.value }(tomb, amtTomb, 0, 0, msg.sender, block.timestamp);
-            _includeAddressInTax(msg.sender);
+        _excludeAddressFromTax(msg.sender);
+
+        IERC20(tomb).transferFrom(msg.sender, address(this), amtTomb);
+        _approveTokenIfNeeded(tomb, uniRouter);
+
+        _includeAddressInTax(msg.sender);
+
+        uint256 resultAmtTomb;
+        uint256 resultAmtFtm;
+        uint256 liquidity;
+        (resultAmtTomb, resultAmtFtm, liquidity) = IUniswapV2Router(uniRouter).addLiquidityETH{value: msg.value}(
+            tomb,
+            amtTomb,
+            amtTombMin,
+            amtFtmMin,
+            msg.sender,
+            block.timestamp
+        );
+
+        if(amtTomb.sub(resultAmtTomb) > 0) {
+            IERC20(tomb).transfer(msg.sender, amtTomb.sub(resultAmtTomb));
         }
+        return (resultAmtTomb, resultAmtFtm, liquidity);
     }
 
     function setTaxableTombOracle(address _tombOracle) external onlyOperator {
@@ -122,11 +172,11 @@ contract TaxOfficeV2 is Operator {
         ITaxable(tomb).setTaxOffice(_newTaxOffice);
     }
 
-    function setTaxFreeLPEnabled(bool enabled) external onlyOperator {
-        TAXFREE_LP_ENABLED = enabled;
-    }
-
-    function taxFreeTransferFrom(address _sender, address _recipient, uint256 _amt) external {
+    function taxFreeTransferFrom(
+        address _sender,
+        address _recipient,
+        uint256 _amt
+    ) external {
         require(taxExclusionEnabled[msg.sender], "Address not approved for tax free transfers");
         _excludeAddressFromTax(_sender);
         IERC20(tomb).transferFrom(_sender, _recipient, _amt);
@@ -142,5 +192,4 @@ contract TaxOfficeV2 is Operator {
             IERC20(_token).approve(_router, type(uint256).max);
         }
     }
-
 }
